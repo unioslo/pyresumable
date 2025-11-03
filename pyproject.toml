@@ -8,7 +8,7 @@ authors = [
 license = "BSD-3-Clause"
 readme = "README.md"
 repository = "https://github.com/unioslo/pyresume"
-packages = [{include = "resumables"}]
+packages = [{include = "pyresumable"}]
 
 [tool.poetry.dependencies]
 python = "^3.10"
