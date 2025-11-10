@@ -14,13 +14,6 @@ from contextlib import contextmanager
 from typing import ContextManager
 from typing import Union
 
-import sqlalchemy
-from sqlalchemy import create_engine
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.exc import OperationalError
-from sqlalchemy.exc import StatementError
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import QueuePool
 
 _IS_VALID_UUID = re.compile(r"([a-f\d0-9-]{32,36})")
 _RW______ = stat.S_IREAD | stat.S_IWRITE
@@ -63,27 +56,21 @@ def db_init(
     path: str,
     name: str = "api-data.db",
     builtin: bool = False,
-) -> Union[sqlalchemy.engine.Engine, sqlite3.Connection]:
-    dbname = name
-    if not builtin:
-        dburl = "sqlite:///" + path + "/" + dbname
-        engine = create_engine(dburl, poolclass=QueuePool)
-    else:
-        engine = sqlite3.connect(path + "/" + dbname)
+) -> sqlite3.Connection:
+    engine = sqlite3.connect(f"{path}/{name}")
     return engine
 
 
 @contextmanager
 def session_scope(
-    engine: sqlalchemy.engine.Engine,
-) -> ContextManager[sqlalchemy.orm.session.Session]:
-    Session = sessionmaker(bind=engine)
-    session = Session()
+        engine: sqlite3.Connection,
+) -> ContextManager[sqlite3.Cursor]:
+    session = engine.cursor()
     try:
         yield session
-        session.commit()
-    except (OperationalError, IntegrityError, StatementError) as e:
-        session.rollback()
+        engine.commit()
+    except Exception as e:
+        engine.rollback()
         raise e
     finally:
         session.close()
@@ -213,7 +200,7 @@ class SerialResumable(AbstractResumable):
         self,
         owner: str,
         work_dir: str,
-    ) -> Union[sqlalchemy.engine.Engine, sqlite3.Connection]:
+    ) -> sqlite3.Connection:
         dbname = "{}{}{}".format(".resumables-", owner, ".db")
         rdb = db_init(work_dir, name=dbname)
         db_path = f"{work_dir}/{dbname}"
@@ -799,7 +786,7 @@ class SerialResumable(AbstractResumable):
                         f"""
                         alter table {resumable_accounting_table} add column key text"""
                     )
-                except OperationalError:
+                except sqlite3.OperationalError:
                     pass  # ^ already altered the table before
             session.execute(
                 f"""
