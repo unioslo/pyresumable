@@ -108,11 +108,11 @@ class AbstractResumable(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def add_chunk(self, fd: io.BufferedRandom, chunk: bytes) -> None:
+    def add_chunk(self, file: io.BufferedRandom, chunk: bytes) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def close_file(self, filename: str) -> None:
+    def close_file(self, file: io.BufferedRandom) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -265,19 +265,19 @@ class SerialResumable(AbstractResumable):
         )
 
     def open_file(self, filename: str, mode: str) -> io.BufferedRandom:
-        fd = open(filename, mode)
+        file = open(filename, mode)
         os.chmod(filename, _RW______)
-        return fd
+        return file
 
-    def add_chunk(self, fd: io.BufferedRandom, chunk: bytes) -> None:
-        if not fd:
+    def add_chunk(self, file: io.BufferedRandom, chunk: bytes) -> None:
+        if not file:
             return
         else:
-            fd.write(chunk)
+            file.write(chunk)
 
-    def close_file(self, fd: str) -> None:
-        if fd:
-            fd.close()
+    def close_file(self, file: io.BufferedRandom) -> None:
+        if file:
+            file.close()
 
     def _refuse_upload_if_not_in_sequential_order(
         self,
