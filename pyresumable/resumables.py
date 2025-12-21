@@ -731,8 +731,8 @@ class SerialResumable(AbstractResumable):
             if chunk_num > 1:
                 try:
                     os.unlink(out_lock)
-                except Exception as e:
-                    logging.exception(e)
+                except:
+                    logging.exception(f"Unlinking {out_lock} aborted")
         if chunk_num >= 5:
             target_chunk_num = chunk_num - 4
             old_chunk = chunk.replace(
@@ -740,8 +740,8 @@ class SerialResumable(AbstractResumable):
             )
             try:
                 os.remove(old_chunk)
-            except Exception as e:
-                logger.error(e)
+            except:
+                logger.exception(f"Removing {old_chunk} aborted")
         return final
 
     def _db_insert_new_for_owner(
