@@ -721,13 +721,12 @@ class SerialResumable(AbstractResumable):
                     shutil.copyfileobj(fin, fout)
             chunk_size = os.stat(chunk).st_size
             assert self._db_update_with_chunk_info(upload_id, chunk_num, chunk_size)
-        except Exception as e:
-            logger.error(e)
+        except:
             os.remove(chunk)
             if size_before_merge is not None:
                 with open(out, "ab") as fout:
                     fout.truncate(size_before_merge)
-            raise e
+            raise
         finally:
             if chunk_num > 1:
                 try:
