@@ -270,14 +270,11 @@ class SerialResumable(AbstractResumable):
         return file
 
     def add_chunk(self, file: io.BufferedRandom, chunk: bytes) -> None:
-        if not file:
-            return
-        else:
-            file.write(chunk)
+        n = file.write(chunk)
+        assert n == len(chunk) # We want to be absolutely sure because per the documentation, `write` is _generally_ (multiple implementations) [permitted to return having written _fewer_ bytes than expected](https://docs.python.org/3/library/io.html#io.RawIOBase.write)
 
     def close_file(self, file: io.BufferedRandom) -> None:
-        if file:
-            file.close()
+        file.close()
 
     def _refuse_upload_if_not_in_sequential_order(
         self,
