@@ -712,6 +712,7 @@ class SerialResumable(AbstractResumable):
         chunk_num = int(last_chunk_filename.split(".chunk.")[-1])
         chunk = chunks_dir + "/" + last_chunk_filename
         try:
+            size_before_merge = None
             if chunk_num > 1:
                 os.link(out, out_lock)
             with open(out, "ab") as fout:
@@ -723,8 +724,9 @@ class SerialResumable(AbstractResumable):
         except Exception as e:
             logger.error(e)
             os.remove(chunk)
-            with open(out, "ab") as fout:
-                fout.truncate(size_before_merge)
+            if size_before_merge is not None:
+                with open(out, "ab") as fout:
+                    fout.truncate(size_before_merge)
             raise e
         finally:
             if chunk_num > 1:
