@@ -11,8 +11,14 @@ import uuid
 from abc import ABC
 from abc import abstractmethod
 from contextlib import contextmanager
+try:
+    from hashlib import file_digest # Available as of Python 3.11
+except ImportError:
+    from .utils import file_digest # Import our equivalent for now
 from typing import ContextManager
 from typing import Union
+
+from .utils import SizeCappedFileReader
 
 
 _IS_VALID_UUID = re.compile(r"([a-f\d0-9-]{32,36})")
@@ -77,11 +83,8 @@ def session_scope(
 
 
 def md5sum(filename: str, blocksize: int = 65536) -> str:
-    _hash = hashlib.md5()
     with open(filename, "rb") as f:
-        for block in iter(lambda: f.read(blocksize), b""):
-            _hash.update(block)
-    return _hash.hexdigest()
+        return file_digest(f, hashlib.md5, _buf_size=blocksize).hexdigest()
 
 
 class AbstractResumable(ABC):
@@ -122,7 +125,8 @@ class AbstractResumable(ABC):
         last_chunk_filename: str,
         upload_id: str,
         owner: str,
-    ) -> str:
+        verify: dict = {}
+    ) -> tuple[str, dict]:
         raise NotImplementedError
 
     @abstractmethod
@@ -132,7 +136,8 @@ class AbstractResumable(ABC):
         last_chunk_filename: str,
         upload_id: str,
         owner: str,
-    ) -> str:
+        verify: dict = {},
+    ) -> tuple[str, dict]:
         raise NotImplementedError
 
     @abstractmethod
@@ -613,12 +618,15 @@ class SerialResumable(AbstractResumable):
         last_chunk_filename: str,
         upload_id: str,
         owner: str,
-    ) -> str:
+        remove_from_database: bool = True,
+        verify: dict = {},
+    ) -> tuple[str, dict]:
         assert ".part" not in last_chunk_filename
         filename = os.path.basename(last_chunk_filename.split(".chunk")[0])
         out = os.path.normpath(work_dir + "/" + filename + "." + upload_id)
         final = out.replace("." + upload_id, "")
         chunks_dir = work_dir + "/" + upload_id
+        state = {} # The procedure currently doesn't do enough to meaningfully load the dictionary; we only return it for consistency with `merge_chunk` which does add some potentially useful (to the client) datums
         if ".chunk.end" in last_chunk_filename:
             logger.info("deleting: %s", chunks_dir)
             try:
@@ -637,10 +645,11 @@ class SerialResumable(AbstractResumable):
                 )  # do not need to fail upload if this does not work
             except OSError as e:
                 logger.error(e)
-            assert self._db_remove_completed_for_owner(upload_id)
+            if remove_from_database:
+                assert self._db_remove_completed_for_owner(upload_id)
         else:
             logger.error("finalise called on non-end chunk")
-        return final
+        return final, state
 
     def merge_chunk(
         self,
@@ -648,7 +657,8 @@ class SerialResumable(AbstractResumable):
         last_chunk_filename: str,
         upload_id: str,
         owner: str,
-    ) -> str:
+        verify: dict = {}
+    ) -> tuple[str, dict]:
         """
         Merge chunks into one file, _in order_.
 
@@ -711,16 +721,34 @@ class SerialResumable(AbstractResumable):
         chunks_dir = work_dir + "/" + upload_id
         chunk_num = int(last_chunk_filename.split(".chunk.")[-1])
         chunk = chunks_dir + "/" + last_chunk_filename
+        state = {}
         try:
             size_before_merge = None
             if chunk_num > 1:
                 os.link(out, out_lock)
             with open(out, "ab") as fout:
+                if __debug__ and "offset" in verify:
+                    assert verify["offset"] == (fout_pos := fout.tell()) # The offset is expected to match the position in the `fout` file, since we'll be writing starting at said position
                 with open(chunk, "rb") as fin:
                     size_before_merge = os.stat(out).st_size
+                    if __debug__ and "offset" in verify:
+                        assert verify["offset"] == size_before_merge # The file opened as `fout` is not expected to contain data _past_ the passed offset value -- that would mean overwriting data with the `copy.fileobj` call below, violating data integrity (producing corruption / loss), also in light of the fact only the last chunk is ever permitted to be merged
                     shutil.copyfileobj(fin, fout)
+                    if __debug__ and "chunk_size" in verify: # Implies `offset` is specified
+                        assert (fout_pos := fout.tell()) == (verify["offset"] + verify["chunk_size"]) # When copying is done with `copyfileobj` we expect the position in the destination file to match the sum of `offset` and `chunk_size` since such sum signifies the end of the chunk, also in light of the fact only the last chunk is ever permitted to be merged
+            if __debug__ and "md5sum" in verify:
+                with open(out, "rb") as fout:
+                    fout.seek(verify["offset"])
+                    md5sum = file_digest(SizeCappedFileReader(fout, verify["chunk_size"]), hashlib.md5).hexdigest()
+                    if verify["md5sum"] == "return": # "return" communicates the caller only wants us to return _our_ checksum
+                        state["md5sum"] = md5sum
+                    else: # Otherwise we validate our value against caller's
+                        assert md5sum == verify["md5sum"]
+
             chunk_size = os.stat(chunk).st_size
-            assert self._db_update_with_chunk_info(upload_id, chunk_num, chunk_size)
+            if __debug__ and "chunk_size" in verify:
+                assert chunk_size == verify["chunk_size"]
+            assert self._db_update_with_chunk_info(upload_id, chunk_num, chunk_size, size_before_merge, md5sum if __debug__ and "md5sum" in verify else None) # `size_before_merge` is used for offset because we have asserted it matches `verify[`offset`]`
         except:
             os.remove(chunk)
             if size_before_merge is not None:
@@ -742,7 +770,7 @@ class SerialResumable(AbstractResumable):
                 os.remove(old_chunk)
             except:
                 logger.exception(f"Removing {old_chunk} aborted")
-        return final
+        return final, state
 
     def _db_insert_new_for_owner(
         self,
@@ -794,7 +822,7 @@ class SerialResumable(AbstractResumable):
             )
             session.execute(
                 f"""
-                create table "{resumable_table}"(chunk_num int, chunk_size int)"""
+                create table "{resumable_table}"(chunk_num int, chunk_size int, offset int, md5sum text)"""
             )
         return True
 
@@ -803,14 +831,16 @@ class SerialResumable(AbstractResumable):
         resumable_id: str,
         chunk_num: int,
         chunk_size: int,
+        offset: Union[str, None] = None,
+        md5sum: Union[str, None] = None
     ) -> bool:
         resumable_table = f"resumable_{resumable_id}"
         with session_scope(self.engine) as session:
             session.execute(
                 f"""
-                insert into "{resumable_table}"(chunk_num, chunk_size)
-                values (:chunk_num, :chunk_size)""",
-                {"chunk_num": chunk_num, "chunk_size": chunk_size},
+                insert into "{resumable_table}"(chunk_num, chunk_size, offset, md5sum)
+                values (:chunk_num, :chunk_size, :offset, :md5sum)""",
+                {"chunk_num": chunk_num, "chunk_size": chunk_size, "offset": offset, "md5sum": md5sum},
             )
         return True
 
