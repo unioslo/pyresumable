@@ -34,9 +34,9 @@ class SizeCappedFileReader:
         return size
 
 # Nearly identical to `hashlib.file_digest` implemented in Python 3.11, but for a subset of input types -- we expect to have migrated to 3.11 before we're paying any maintenance cost for our own implementation
-def file_digest(file, digest, /, *, _buf_size=2**18): # Equivalent to upstream
+def file_digest(file, digest, /, *, _bufsize=2**18): # Equivalent to upstream
     hasher = hashlib.new(digest) if isinstance(digest, str) else digest()
-    buf = bytearray(_buf_size)
+    buf = bytearray(_bufsize)
     view = memoryview(buf)
     while size := file.readinto(buf):
         hasher.update(view[:size])

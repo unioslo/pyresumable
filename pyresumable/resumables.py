@@ -84,7 +84,7 @@ def session_scope(
 
 def md5sum(filename: str, blocksize: int = 65536) -> str:
     with open(filename, "rb") as f:
-        return file_digest(f, hashlib.md5, _buf_size=blocksize).hexdigest()
+        return file_digest(f, hashlib.md5, _bufsize=blocksize).hexdigest()
 
 
 class AbstractResumable(ABC):
