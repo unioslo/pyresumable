@@ -832,16 +832,25 @@ class SerialResumable(AbstractResumable):
         chunk_num: int,
         chunk_size: int,
         offset: Union[str, None] = None,
-        md5sum: Union[str, None] = None
+        md5sum: Union[str, None] = None,
+        *,
+        upgrade_schema_on_error = True # Alter the [database] table(s) to match expected schema if the initial update attempt fails, and retry once
     ) -> bool:
         resumable_table = f"resumable_{resumable_id}"
         with session_scope(self.engine) as session:
-            session.execute(
-                f"""
-                insert into "{resumable_table}"(chunk_num, chunk_size, offset, md5sum)
-                values (:chunk_num, :chunk_size, :offset, :md5sum)""",
-                {"chunk_num": chunk_num, "chunk_size": chunk_size, "offset": offset, "md5sum": md5sum},
-            )
+            try:
+                session.execute(
+                    f"""
+                    insert into "{resumable_table}"(chunk_num, chunk_size, offset, md5sum)
+                    values (:chunk_num, :chunk_size, :offset, :md5sum)""",
+                    {"chunk_num": chunk_num, "chunk_size": chunk_size, "offset": offset, "md5sum": md5sum},
+                )
+            except sqlite3.OperationalError:
+                logger.debug("Error inserting chunk record into the resumable database table", exc_info=True)
+                # Assume the error is due to missing column(s) -- the error doesn't lend to machine analysis so this is simply the best practical way if we stick to the easier-to-ask-for-forgiveness-than-permission via `try` and `except`; alternatively, find all database(s) early for a single tenant and migrate them _all_ at the earliest opportunity
+                session.execute(f"""alter table "{resumable_table}" add column offset int""")
+                session.execute(f"""alter table "{resumable_table}" add column md5sum str""")
+                return self._db_update_with_chunk_info(resumable_id, chunk_num, chunk_size, offset, md5sum, upgrade_schema_on_error=False) # Retry once (no attempts to upgrade on failure)
         return True
 
     def _db_pop_chunk(self, resumable_id: str, chunk_num: int) -> bool:
