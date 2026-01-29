@@ -846,6 +846,8 @@ class SerialResumable(AbstractResumable):
                     {"chunk_num": chunk_num, "chunk_size": chunk_size, "offset": offset, "md5sum": md5sum},
                 )
             except sqlite3.OperationalError:
+                if not upgrade_schema_on_error:
+                    raise
                 logger.debug("Error inserting chunk record into the resumable database table", exc_info=True)
                 # Assume the error is due to missing column(s) -- the error doesn't lend to machine analysis so this is simply the best practical way if we stick to the easier-to-ask-for-forgiveness-than-permission via `try` and `except`; alternatively, find all database(s) early for a single tenant and migrate them _all_ at the earliest opportunity
                 session.execute(f"""alter table "{resumable_table}" add column offset int""")
