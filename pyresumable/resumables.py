@@ -199,7 +199,13 @@ class SerialResumable(AbstractResumable):
         super().__init__(work_dir, owner)
         self.work_dir = work_dir
         self.owner = owner
-        self.engine = self._init_db(owner, work_dir)
+        self._thread_local = threading.local() # To hold SQLite objects; SQLite demands e.g. connection objects only be used on the same thread they're created on
+
+    @property
+    def engine(self) -> sqlite3.Connection:
+        if not hasattr(self._thread_local, "engine"):
+            self._thread_local.engine = self._init_db(self.owner, self.work_dir)
+        return self._thread_local.engine
 
     def _init_db(
         self,
