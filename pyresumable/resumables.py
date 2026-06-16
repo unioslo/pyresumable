@@ -94,7 +94,7 @@ class AbstractResumable(ABC):
         self.owner = owner
 
     @abstractmethod
-    def prepare(
+    async def prepare(
         self,
         work_dir: str,
         in_filename: str,
@@ -111,15 +111,15 @@ class AbstractResumable(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def add_chunk(self, file: AsyncBufferedRandom, chunk: bytes) -> None:
+    async def add_chunk(self, file: AsyncBufferedRandom, chunk: bytes) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def close_file(self, file: AsyncBufferedRandom) -> None:
+    async def close_file(self, file: AsyncBufferedRandom) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def merge_chunk(
+    async def merge_chunk(
         self,
         work_dir: str,
         last_chunk_filename: str,
@@ -130,7 +130,7 @@ class AbstractResumable(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def finalise(
+    async def finalise(
         self,
         work_dir: str,
         last_chunk_filename: str,
@@ -141,7 +141,7 @@ class AbstractResumable(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def list_all(
+    async def list_all(
         self,
         work_dir: str,
         owner: str,
@@ -150,7 +150,7 @@ class AbstractResumable(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def info(
+    async def info(
         self,
         work_dir: str,
         filename: str,
@@ -161,7 +161,7 @@ class AbstractResumable(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def delete(
+    async def delete(
         self,
         work_dir: str,
         filename: str,
