@@ -1,6 +1,8 @@
 import os
 from typing_extensions import Buffer # TODO: When upgrading dependencies to demand Python >=3.12, change `typing_extensions` to `collections.abc`
 
+from . import aio
+
 AsyncRawIOBase = aio.io.RawIOBase
 
 from asyncio import to_thread
