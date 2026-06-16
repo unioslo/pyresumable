@@ -5,18 +5,18 @@ import logging
 import os
 import re
 import shutil
-import sqlite3
+import aiosqlite
 import stat
 import threading
 import uuid
 from abc import ABC
 from abc import abstractmethod
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 try:
     from hashlib import file_digest # Available as of Python 3.11
 except ImportError:
     from .utils import file_digest # Import our equivalent for now
-from typing import ContextManager
+from typing import AsyncContextManager
 from typing import Union
 
 from .utils import SizeCappedFileReader
@@ -59,28 +59,28 @@ def _resumables_cmp(a: tuple, b: tuple) -> int:
         return 1
 
 
-def db_init(
+async def db_init(
     path: str,
     name: str = "api-data.db",
     builtin: bool = False,
-) -> sqlite3.Connection:
-    engine = sqlite3.connect(f"{path}/{name}")
+) -> aiosqlite.Connection:
+    engine = await aiosqlite.connect(f"{path}/{name}")
     return engine
 
 
-@contextmanager
-def session_scope(
-        engine: sqlite3.Connection,
-) -> ContextManager[sqlite3.Cursor]:
-    session = engine.cursor()
+@asynccontextmanager
+async def session_scope(
+        engine: aiosqlite.Connection,
+) -> AsyncContextManager[aiosqlite.Cursor]:
+    session = await engine.cursor()
     try:
         yield session
-        engine.commit()
+        await engine.commit()
     except Exception as e:
-        engine.rollback()
+        await engine.rollback()
         raise e
     finally:
-        session.close()
+        await session.close()
 
 
 def md5sum(filename: str, blocksize: int = 65536) -> str:
@@ -196,31 +196,44 @@ class SerialResumable(AbstractResumable):
 
     """
 
+    engine = None
+
     def __init__(self, work_dir: str = None, owner: str = None) -> None:
         super().__init__(work_dir, owner)
         self.work_dir = work_dir
         self.owner = owner
-        self._thread_local = threading.local() # To hold SQLite objects; SQLite demands e.g. connection objects only be used on the same thread they're created on
 
-    @property
-    def engine(self) -> sqlite3.Connection:
-        if not hasattr(self._thread_local, "engine"):
-            self._thread_local.engine = self._init_db(self.owner, self.work_dir)
-        return self._thread_local.engine
+    async def __aenter__(self):
+        return self
 
-    def _init_db(
+    async def __aexit__(self, *_):
+        await self.aclose()
+
+    async def aclose(self):
+        if self.engine:
+            await self.engine.close()
+            del self.engine # This allows the resumable to be used as a context manager (`async with`) _more than once_ [during its lifetime], re-connecting the database each time
+
+    @asynccontextmanager
+    async def session_scope(self):
+        if not self.engine:
+            self.engine = await self._init_db(self.owner, self.work_dir)
+        async with session_scope(self.engine) as session:
+            yield session
+
+    async def _init_db(
         self,
         owner: str,
         work_dir: str,
-    ) -> sqlite3.Connection:
+    ) -> aiosqlite.Connection:
         dbname = "{}{}{}".format(".resumables-", owner, ".db")
-        rdb = db_init(work_dir, name=dbname)
+        rdb = await db_init(work_dir, name=dbname)
         db_path = f"{work_dir}/{dbname}"
         if os.path.lexists(db_path):
             os.chmod(db_path, _RW______)
         return rdb
 
-    def prepare(
+    async def prepare(
         self,
         work_dir: str,
         in_filename: str,
@@ -260,7 +273,7 @@ class SerialResumable(AbstractResumable):
             chunk_order_correct = True
         elif chunk_num == 1:
             os.makedirs(work_dir + "/" + upload_id)
-            assert self._db_insert_new_for_owner(upload_id, url_group, key=key)
+            assert await self._db_insert_new_for_owner(upload_id, url_group, key=key)
             chunk_order_correct = True
             completed_resumable_file = None
         elif chunk_num > 1:
@@ -317,7 +330,7 @@ class SerialResumable(AbstractResumable):
         out = completed_chunks[n] if completed_chunks else ""
         return out
 
-    def _find_relevant_resumable_dir(
+    async def _find_relevant_resumable_dir(
         self,
         work_dir: str,
         filename: str,
@@ -336,7 +349,7 @@ class SerialResumable(AbstractResumable):
 
         """
         relevant = None
-        potential_resumables = self._db_get_all_resumable_ids_for_owner(key=key)
+        potential_resumables = await self._db_get_all_resumable_ids_for_owner(key=key)
         if not upload_id:
             logger.info("Trying to find a matching resumable for %s", filename)
             candidates = []
@@ -348,7 +361,7 @@ class SerialResumable(AbstractResumable):
             candidates = sorted(candidates, key=functools.cmp_to_key(_resumables_cmp))
             for cand in candidates:
                 upload_id = cand[1]
-                first_chunk = self._find_nth_chunk(work_dir, upload_id, filename, 1)
+                first_chunk = await self._find_nth_chunk(work_dir, upload_id, filename, 1)
                 if filename in first_chunk:
                     relevant = cand[1]
                     break
@@ -360,13 +373,13 @@ class SerialResumable(AbstractResumable):
                     relevant = pr
         return relevant
 
-    def list_all(
+    async def list_all(
         self,
         work_dir: str,
         owner: str,
         key: str = None,
     ) -> dict:
-        potential_resumables = self._db_get_all_resumable_ids_for_owner(key=key)
+        potential_resumables = await self._db_get_all_resumable_ids_for_owner(key=key)
         info = []
         for item in potential_resumables:
             chunk_size = None
@@ -383,19 +396,19 @@ class SerialResumable(AbstractResumable):
                         warning,
                         recommendation,
                         filename,
-                    ) = self._get_resumable_chunk_info(current_pr, work_dir)
+                    ) = await self._get_resumable_chunk_info(current_pr, work_dir)
                     if recommendation == "end":
                         next_offset = "end"
                 except (OSError, Exception):
                     pass
                 if chunk_size:
                     try:
-                        group = self._db_get_group(pr)
+                        group = await self._db_get_group(pr)
                     except Exception:
                         group = None
                     key = None
                     try:
-                        key = self._db_get_key(pr)
+                        key = await self._db_get_key(pr)
                     except Exception:  # for transition
                         pass
                     info.append(
@@ -471,7 +484,7 @@ class SerialResumable(AbstractResumable):
             logger.error(e)
             return chunks, "not sure what to do", "end"
 
-    def _get_resumable_chunk_info(self, resumable_dir: str, work_dir: str) -> tuple:
+    async def _get_resumable_chunk_info(self, resumable_dir: str, work_dir: str) -> tuple:
         """
         Get information needed to resume an upload.
         If the server-side data is inconsistent, then
@@ -484,13 +497,13 @@ class SerialResumable(AbstractResumable):
 
         """
 
-        def info(
+        async def _info(
             chunks: list, recommendation: str = None, warning: str = None
         ) -> tuple:
             num = int(chunks[-1].split(".")[-1])
             latest_size = _bytes(chunks[-1])
             upload_id = os.path.basename(resumable_dir)
-            next_offset = self._db_get_total_size(upload_id)
+            next_offset = await self._db_get_total_size(upload_id)
             previous_offset = next_offset - latest_size
             filename = os.path.basename(chunks[-1].split(".chunk")[0])
             merged_file = os.path.normpath(work_dir + "/" + filename + "." + upload_id)
@@ -512,7 +525,7 @@ class SerialResumable(AbstractResumable):
                         _bytes(merged_file),
                         next_offset,
                     )
-                    return info(chunks)
+                    return await _info(chunks)
                 except Exception as e:
                     logger.error(e)
                     return None, None, None, None, None, None, None, None
@@ -535,9 +548,9 @@ class SerialResumable(AbstractResumable):
         all_chunks = [f"{resumable_dir}/{i}" for i in os.listdir(resumable_dir)]
         all_chunks.sort(key=_natural_keys)
         chunks = [c for c in all_chunks if ".part" not in c]
-        return info(chunks)
+        return await _info(chunks)
 
-    def info(
+    async def info(
         self,
         work_dir: str,
         filename: str,
@@ -545,7 +558,7 @@ class SerialResumable(AbstractResumable):
         owner: str,
         key: str = None,
     ) -> dict:
-        relevant_dir = self._find_relevant_resumable_dir(
+        relevant_dir = await self._find_relevant_resumable_dir(
             work_dir, filename, upload_id, key=key
         )
         if not relevant_dir:
@@ -561,14 +574,14 @@ class SerialResumable(AbstractResumable):
             warning,
             recommendation,
             filename,
-        ) = self._get_resumable_chunk_info(resumable_dir, work_dir)
+        ) = await self._get_resumable_chunk_info(resumable_dir, work_dir)
         identifier = upload_id if upload_id else relevant_dir
         try:
-            group = self._db_get_group(identifier)
+            group = await self._db_get_group(identifier)
         except Exception:
             group = None
         try:
-            key = self._db_get_key(identifier)
+            key = await self._db_get_key(identifier)
         except Exception:  # for transition
             key = None
         if recommendation == "end":
@@ -595,7 +608,7 @@ class SerialResumable(AbstractResumable):
         ]
         return full_chunks_on_disk
 
-    def delete(
+    async def delete(
         self,
         work_dir: str,
         filename: str,
@@ -603,14 +616,14 @@ class SerialResumable(AbstractResumable):
         owner: str,
     ) -> bool:
         try:
-            assert self._db_upload_belongs_to_owner(upload_id), (
+            assert await self._db_upload_belongs_to_owner(upload_id), (
                 "upload does not belong to user"
             )
             relevant_dir = work_dir + "/" + upload_id
             relevant_merged_file = work_dir + "/" + filename + "." + upload_id
             shutil.rmtree(relevant_dir)
             os.remove(relevant_merged_file)
-            assert self._db_remove_completed_for_owner(upload_id), (
+            assert await self._db_remove_completed_for_owner(upload_id), (
                 "could not remove data from resumables db"
             )
             return True
@@ -619,7 +632,7 @@ class SerialResumable(AbstractResumable):
             logger.error("could not complete resumable deletion")
             return False
 
-    def finalise(
+    async def finalise(
         self,
         work_dir: str,
         last_chunk_filename: str,
@@ -653,12 +666,12 @@ class SerialResumable(AbstractResumable):
             except OSError as e:
                 logger.error(e)
             if remove_from_database:
-                assert self._db_remove_completed_for_owner(upload_id)
+                assert await self._db_remove_completed_for_owner(upload_id)
         else:
             logger.error("finalise called on non-end chunk")
         return final, state
 
-    def merge_chunk(
+    async def merge_chunk(
         self,
         work_dir: str,
         last_chunk_filename: str,
@@ -755,7 +768,7 @@ class SerialResumable(AbstractResumable):
             chunk_size = os.stat(chunk).st_size
             if __debug__ and "chunk_size" in verify:
                 assert chunk_size == verify["chunk_size"]
-            assert self._db_update_with_chunk_info(upload_id, chunk_num, chunk_size, size_before_merge, md5sum if __debug__ and "md5sum" in verify else None) # `size_before_merge` is used for offset because we have asserted it matches `verify[`offset`]`
+            assert await self._db_update_with_chunk_info(upload_id, chunk_num, chunk_size, size_before_merge, md5sum if __debug__ and "md5sum" in verify else None) # `size_before_merge` is used for offset because we have asserted it matches `verify[`offset`]`
         except:
             os.remove(chunk)
             if size_before_merge is not None:
@@ -779,7 +792,7 @@ class SerialResumable(AbstractResumable):
                 logger.exception(f"Removing {old_chunk} aborted")
         return final, state
 
-    def _db_insert_new_for_owner(
+    async def _db_insert_new_for_owner(
         self,
         resumable_id: str,
         group: str,
@@ -792,11 +805,11 @@ class SerialResumable(AbstractResumable):
         """
         resumable_accounting_table = "resumable_uploads"
         resumable_table = f"resumable_{resumable_id}"
-        with session_scope(self.engine) as session:
+        async with self.session_scope() as session:
             resumables_table_exists = False
-            current_tables = session.execute(
+            current_tables = await (await session.execute(
                 "select name FROM sqlite_master where type = 'table'"
-            ).fetchall()
+            )).fetchall()
             if len(current_tables) == 0:
                 pass
             else:
@@ -805,7 +818,7 @@ class SerialResumable(AbstractResumable):
                         resumables_table_exists = True
                         break
             if not resumables_table_exists:
-                session.execute(
+                await session.execute(
                     f"""
                     create table if not exists {resumable_accounting_table}(
                         id text,
@@ -815,25 +828,25 @@ class SerialResumable(AbstractResumable):
                 )
             else:
                 try:
-                    session.execute(
+                    await session.execute(
                         f"""
                         alter table {resumable_accounting_table} add column key text"""
                     )
-                except sqlite3.OperationalError:
+                except aiosqlite.OperationalError:
                     pass  # ^ already altered the table before
-            session.execute(
+            await session.execute(
                 f"""
                 insert into {resumable_accounting_table} (id, upload_group, key)
                 values (:resumable_id, :upload_group, :key)""",
                 {"resumable_id": resumable_id, "upload_group": group, "key": key},
             )
-            session.execute(
+            await session.execute(
                 f"""
                 create table "{resumable_table}"(chunk_num int, chunk_size int, offset int, md5sum text)"""
             )
         return True
 
-    def _db_update_with_chunk_info(
+    async def _db_update_with_chunk_info(
         self,
         resumable_id: str,
         chunk_num: int,
@@ -844,28 +857,28 @@ class SerialResumable(AbstractResumable):
         upgrade_schema_on_error = True # Alter the [database] table(s) to match expected schema if the initial update attempt fails, and retry once
     ) -> bool:
         resumable_table = f"resumable_{resumable_id}"
-        with session_scope(self.engine) as session:
+        async with self.session_scope() as session:
             try:
-                session.execute(
+                await session.execute(
                     f"""
                     insert into "{resumable_table}"(chunk_num, chunk_size, offset, md5sum)
                     values (:chunk_num, :chunk_size, :offset, :md5sum)""",
                     {"chunk_num": chunk_num, "chunk_size": chunk_size, "offset": offset, "md5sum": md5sum},
                 )
-            except sqlite3.OperationalError:
+            except aiosqlite.OperationalError:
                 if not upgrade_schema_on_error:
                     raise
                 logger.debug("Error inserting chunk record into the resumable database table", exc_info=True)
                 # Assume the error is due to missing column(s) -- the error doesn't lend to machine analysis so this is simply the best practical way if we stick to the easier-to-ask-for-forgiveness-than-permission via `try` and `except`; alternatively, find all database(s) early for a single tenant and migrate them _all_ at the earliest opportunity
-                session.execute(f"""alter table "{resumable_table}" add column offset int""")
-                session.execute(f"""alter table "{resumable_table}" add column md5sum str""")
+                await session.execute(f"""alter table "{resumable_table}" add column offset int""")
+                await session.execute(f"""alter table "{resumable_table}" add column md5sum str""")
                 return self._db_update_with_chunk_info(resumable_id, chunk_num, chunk_size, offset, md5sum, upgrade_schema_on_error=False) # Retry once (no attempts to upgrade on failure)
         return True
 
-    def _db_pop_chunk(self, resumable_id: str, chunk_num: int) -> bool:
+    async def _db_pop_chunk(self, resumable_id: str, chunk_num: int) -> bool:
         resumable_table = f"resumable_{resumable_id}"
-        with session_scope(self.engine) as session:
-            session.execute(
+        async with self.session_scope() as session:
+            await session.execute(
                 f"""
                 delete from "{resumable_table}"
                 where chunk_num = :chunk_num""",
@@ -873,39 +886,39 @@ class SerialResumable(AbstractResumable):
             )
         return True
 
-    def _db_get_total_size(self, resumable_id: str) -> int:
+    async def _db_get_total_size(self, resumable_id: str) -> int:
         resumable_table = f"resumable_{resumable_id}"
-        with session_scope(self.engine) as session:
-            res = session.execute(
+        async with self.session_scope() as session:
+            res = (await (await session.execute(
                 f'select sum(chunk_size) from "{resumable_table}"'
-            ).fetchone()[0]
+            )).fetchone())[0]
         return res
 
-    def _db_get_group(self, resumable_id: str) -> str:
-        with session_scope(self.engine) as session:
-            res = session.execute(
+    async def _db_get_group(self, resumable_id: str) -> str:
+        async with self.session_scope() as session:
+            res = (await (await session.execute(
                 "select upload_group from resumable_uploads where id = :resumable_id",
                 {"resumable_id": resumable_id},
-            ).fetchone()[0]
+            )).fetchone())[0]
         return res
 
-    def _db_get_key(self, resumable_id: str) -> str:
-        with session_scope(self.engine) as session:
-            res = session.execute(
+    async def _db_get_key(self, resumable_id: str) -> str:
+        async with self.session_scope() as session:
+            res = (await (await session.execute(
                 "select key from resumable_uploads where id = :resumable_id",
                 {"resumable_id": resumable_id},
-            ).fetchone()[0]
+            )).fetchone())[0]
         return res
 
-    def _db_upload_belongs_to_owner(self, resumable_id: str) -> bool:
-        with session_scope(self.engine) as session:
-            res = session.execute(
+    async def _db_upload_belongs_to_owner(self, resumable_id: str) -> bool:
+        async with self.session_scope() as session:
+            res = (await (await session.execute(
                 "select count(1) from resumable_uploads where id = :resumable_id",
                 {"resumable_id": resumable_id},
-            ).fetchone()[0]
+            )).fetchone())[0]
         return True if res > 0 else False
 
-    def _db_get_all_resumable_ids_for_owner(self, key: str = None) -> list:
+    async def _db_get_all_resumable_ids_for_owner(self, key: str = None) -> list:
         try:
             params = {}
             if key:
@@ -913,18 +926,18 @@ class SerialResumable(AbstractResumable):
                 params["key"] = key
             else:
                 query = "select id from resumable_uploads"
-            with session_scope(self.engine) as session:
-                res = session.execute(query, params).fetchall()
+            async with self.session_scope() as session:
+                res = await (await session.execute(query, params)).fetchall()
         except Exception:
             return []
         return res  # [(id,), (id,)]
 
-    def _db_remove_completed_for_owner(self, resumable_id: str) -> bool:
+    async def _db_remove_completed_for_owner(self, resumable_id: str) -> bool:
         resumable_table = f"resumable_{resumable_id}"
-        with session_scope(self.engine) as session:
-            session.execute(
+        async with self.session_scope() as session:
+            await session.execute(
                 "delete from resumable_uploads where id = :resumable_id",
                 {"resumable_id": resumable_id},
             )
-            session.execute(f'drop table "{resumable_table}"')
+            await session.execute(f'drop table "{resumable_table}"')
         return True
