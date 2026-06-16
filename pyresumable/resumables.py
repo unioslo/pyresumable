@@ -107,7 +107,7 @@ class AbstractResumable(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def open_file(self, filename: str, **open_kwargs) -> AsyncBufferedRandom:
+    async def open_file(self, filename: str, *args, **kwargs) -> AsyncBufferedRandom:
         raise NotImplementedError
 
     @abstractmethod
@@ -288,8 +288,8 @@ class SerialResumable(AbstractResumable):
             filename,
         )
 
-    async def open_file(self, filename: str, **open_kwargs) -> AsyncBufferedRandom:
-        file = await aio.open(filename, **open_kwargs)
+    async def open_file(self, filename: str, *args, **kwargs) -> AsyncBufferedRandom:
+        file = await aio.open(filename, *args, **kwargs)
         await aio.os.chmod(filename, _RW______)
         return file
 
@@ -297,7 +297,7 @@ class SerialResumable(AbstractResumable):
         n = await file.write(chunk)
         assert n == len(chunk) # We want to be absolutely sure because per the documentation, `write` is _generally_ (multiple implementations) [permitted to return having written _fewer_ bytes than expected](https://docs.python.org/3/library/io.html#io.RawIOBase.write)
 
-    async close_file(self, file: AsyncBufferedRandom) -> None:
+    async def close_file(self, file: AsyncBufferedRandom) -> None:
         await file.close()
 
     async def _refuse_upload_if_not_in_sequential_order(
