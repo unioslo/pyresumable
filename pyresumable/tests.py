@@ -82,7 +82,7 @@ class TestResumables(unittest.TestCase):
             chunk_filename = os.path.basename(out[-1])
 
             # finish the resumable
-            completed = res1.finalise(work_dir, chunk_filename, upload_id, owner)
+            completed, _* = res1.finalise(work_dir, chunk_filename, upload_id, owner)
 
             # check content
             expected_content = new_data1 + new_data2
