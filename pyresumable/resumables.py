@@ -1,10 +1,8 @@
 import functools
 import hashlib
-import io
 import logging
 import os
 import re
-import shutil
 import aiosqlite
 import stat
 import threading
@@ -12,15 +10,16 @@ import uuid
 from abc import ABC
 from abc import abstractmethod
 from contextlib import asynccontextmanager
-try:
-    from hashlib import file_digest # Available as of Python 3.11
-except ImportError:
-    from .utils import file_digest # Import our equivalent for now
 from typing import AsyncContextManager
+from typing import TypeAlias
 from typing import Union
 
+from .utils import file_digest
 from .utils import SizeCappedFileReader
 
+from tsdfileapi import aio # TODO: Implement dependency injection so that the client [of this library] can exercise control over which implementation of asynchronous standard library (not provided in Python) it prefers the library uses; this isn't just a nice-to-have feature -- it's critical that the library invokes primitives that the client vouches for, because mixing and matching doesn't always work, and this is indeed but a library (i.e. it shouldn't impose its own choice); currently we exploit the fact that only `tsdfileapi` uses this module in the wild, and for other clients where `tsdfileapi` won't resolve, the import machinery will rightfully raise and error so it's either correct behaviour or a fatal error (read: we are strict and better that Python aborts if this crude method of dependency injection cannot succeed)
+
+AsyncBufferedRandom: TypeAlias = aio.io.BufferedRandom
 
 _IS_VALID_UUID = re.compile(r"([a-f\d0-9-]{32,36})")
 _RW______ = stat.S_IREAD | stat.S_IWRITE
@@ -83,9 +82,9 @@ async def session_scope(
         await session.close()
 
 
-def md5sum(filename: str, blocksize: int = 65536) -> str:
-    with open(filename, "rb") as f:
-        return file_digest(f, hashlib.md5, _bufsize=blocksize).hexdigest()
+async def md5sum(filename: str, blocksize: int = 65536) -> str:
+    async with aio.open(filename, "rb") as f:
+        return (await file_digest(f, hashlib.md5, _bufsize=blocksize)).hexdigest()
 
 
 class AbstractResumable(ABC):
@@ -108,15 +107,15 @@ class AbstractResumable(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def open_file(self, filename: str, mode: str) -> io.BufferedRandom:
+    def open_file(self, filename: str, **open_kwargs) -> AsyncBufferedRandom:
         raise NotImplementedError
 
     @abstractmethod
-    def add_chunk(self, file: io.BufferedRandom, chunk: bytes) -> None:
+    def add_chunk(self, file: AsyncBufferedRandom, chunk: bytes) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def close_file(self, file: io.BufferedRandom) -> None:
+    def close_file(self, file: AsyncBufferedRandom) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -229,8 +228,8 @@ class SerialResumable(AbstractResumable):
         dbname = "{}{}{}".format(".resumables-", owner, ".db")
         rdb = await db_init(work_dir, name=dbname)
         db_path = f"{work_dir}/{dbname}"
-        if os.path.lexists(db_path):
-            os.chmod(db_path, _RW______)
+        if await aio.os.path.lexists(db_path):
+            await aio.os.chmod(db_path, _RW______)
         return rdb
 
     async def prepare(
@@ -272,12 +271,12 @@ class SerialResumable(AbstractResumable):
             completed_resumable_file = True
             chunk_order_correct = True
         elif chunk_num == 1:
-            os.makedirs(work_dir + "/" + upload_id)
+            await aio.os.makedirs(work_dir + "/" + upload_id)
             assert await self._db_insert_new_for_owner(upload_id, url_group, key=key)
             chunk_order_correct = True
             completed_resumable_file = None
         elif chunk_num > 1:
-            chunk_order_correct = self._refuse_upload_if_not_in_sequential_order(
+            chunk_order_correct = await self._refuse_upload_if_not_in_sequential_order(
                 work_dir, upload_id, chunk_num
             )
             completed_resumable_file = None
@@ -289,33 +288,33 @@ class SerialResumable(AbstractResumable):
             filename,
         )
 
-    def open_file(self, filename: str, mode: str) -> io.BufferedRandom:
-        file = open(filename, mode)
-        os.chmod(filename, _RW______)
+    async def open_file(self, filename: str, **open_kwargs) -> AsyncBufferedRandom:
+        file = await aio.open(filename, **open_kwargs)
+        await aio.os.chmod(filename, _RW______)
         return file
 
-    def add_chunk(self, file: io.BufferedRandom, chunk: bytes) -> None:
-        n = file.write(chunk)
+    async def add_chunk(self, file: AsyncBufferedRandom, chunk: bytes) -> None:
+        n = await file.write(chunk)
         assert n == len(chunk) # We want to be absolutely sure because per the documentation, `write` is _generally_ (multiple implementations) [permitted to return having written _fewer_ bytes than expected](https://docs.python.org/3/library/io.html#io.RawIOBase.write)
 
-    def close_file(self, file: io.BufferedRandom) -> None:
-        file.close()
+    async close_file(self, file: AsyncBufferedRandom) -> None:
+        await file.close()
 
-    def _refuse_upload_if_not_in_sequential_order(
+    async def _refuse_upload_if_not_in_sequential_order(
         self,
         work_dir: str,
         upload_id: str,
         chunk_num: int,
     ) -> bool:
         chunk_order_correct = True
-        full_chunks_on_disk = self._get_full_chunks_on_disk(work_dir, upload_id)
+        full_chunks_on_disk = await self._get_full_chunks_on_disk(work_dir, upload_id)
         previous_chunk_num = int(full_chunks_on_disk[-1].split(".chunk.")[-1])
         if chunk_num <= previous_chunk_num or (chunk_num - previous_chunk_num) >= 2:
             chunk_order_correct = False
             logger.error("chunks must be uploaded in sequential order")
         return chunk_order_correct
 
-    def _find_nth_chunk(
+    async def _find_nth_chunk(
         self,
         work_dir: str,
         upload_id: str,
@@ -324,7 +323,7 @@ class SerialResumable(AbstractResumable):
     ) -> str:
         n = n - 1  # chunk numbers start at 1, but keep 0-based for the signaure
         current_resumable = f"{work_dir}/{upload_id}"
-        files = os.listdir(current_resumable)
+        files = await aio.os.listdir(current_resumable)
         files.sort(key=_natural_keys)
         completed_chunks = [f for f in files if ".part" not in f]
         out = completed_chunks[n] if completed_chunks else ""
@@ -356,8 +355,8 @@ class SerialResumable(AbstractResumable):
             for item in potential_resumables:
                 pr = item[0]
                 current_pr = f"{work_dir}/{pr}"
-                if _IS_VALID_UUID.match(pr) and os.path.lexists(current_pr):
-                    candidates.append((os.stat(current_pr).st_mtime, pr))
+                if _IS_VALID_UUID.match(pr) and await aio.os.path.lexists(current_pr):
+                    candidates.append(((await aio.os.stat(current_pr)).st_mtime, pr))
             candidates = sorted(candidates, key=functools.cmp_to_key(_resumables_cmp))
             for cand in candidates:
                 upload_id = cand[1]
@@ -426,7 +425,7 @@ class SerialResumable(AbstractResumable):
                     )
         return {"resumables": info}
 
-    def _repair_inconsistent_resumable(
+    async def _repair_inconsistent_resumable(
         self,
         merged_file: str,
         chunks: list,
@@ -455,7 +454,7 @@ class SerialResumable(AbstractResumable):
             return False
         else:
             last_chunk = chunks[-1]
-            last_chunk_size = os.stat(last_chunk).st_size
+            last_chunk_size = (await aio.os.stat(last_chunk)).st_size
         if merged_file_size == sum_chunks_size:
             logger.info("server-side data consistent")
             return chunks
@@ -465,12 +464,12 @@ class SerialResumable(AbstractResumable):
             diff = sum_chunks_size - merged_file_size
             if (merged_file_size < sum_chunks_size) and (diff <= last_chunk_size):
                 target_size = sum_chunks_size - last_chunk_size
-                with open(merged_file, "ab") as f:
-                    f.truncate(target_size)
-                with open(merged_file, "ab") as fout:
-                    with open(last_chunk, "rb") as fin:
-                        shutil.copyfileobj(fin, fout)
-                new_merged_size = os.stat(merged_file).st_size
+                async with aio.open(merged_file, "ab") as f:
+                    await f.truncate(target_size)
+                async with aio.open(merged_file, "ab") as fout:
+                    async with aio.open(last_chunk, "rb") as fin:
+                        await aio.shutil.copyfileobj(fin, fout)
+                new_merged_size = (await aio.os.stat(merged_file)).st_size
                 logger.info(
                     "merged file after repair: %d sum of chunks: %d",
                     new_merged_size,
@@ -501,7 +500,7 @@ class SerialResumable(AbstractResumable):
             chunks: list, recommendation: str = None, warning: str = None
         ) -> tuple:
             num = int(chunks[-1].split(".")[-1])
-            latest_size = _bytes(chunks[-1])
+            latest_size = await _bytes(chunks[-1])
             upload_id = os.path.basename(resumable_dir)
             next_offset = await self._db_get_total_size(upload_id)
             previous_offset = next_offset - latest_size
@@ -511,7 +510,7 @@ class SerialResumable(AbstractResumable):
                 # check that the size of the merge file
                 # matches what we calculate from the
                 # chunks recorded in the resumable db
-                assert _bytes(merged_file) == next_offset
+                assert (await _bytes(merged_file)) == next_offset
             except AssertionError:
                 try:
                     logger.info("trying to repair inconsistent data")
@@ -519,10 +518,10 @@ class SerialResumable(AbstractResumable):
                         chunks,
                         warning,
                         recommendation,
-                    ) = self._repair_inconsistent_resumable(
+                    ) = await self._repair_inconsistent_resumable(
                         merged_file,
                         chunks,
-                        _bytes(merged_file),
+                        await _bytes(merged_file),
                         next_offset,
                     )
                     return await _info(chunks)
@@ -532,7 +531,7 @@ class SerialResumable(AbstractResumable):
             return (
                 latest_size,
                 num,
-                md5sum(chunks[-1]),
+                await md5sum(chunks[-1]),
                 previous_offset,
                 next_offset,
                 recommendation,
@@ -540,12 +539,12 @@ class SerialResumable(AbstractResumable):
                 filename,
             )
 
-        def _bytes(chunk: str) -> int:
-            size = os.stat(chunk).st_size
+        async def _bytes(chunk: str) -> int:
+            size = (await aio.os.stat(chunk)).st_size
             return size
 
         # may contain partial files, due to failed requests
-        all_chunks = [f"{resumable_dir}/{i}" for i in os.listdir(resumable_dir)]
+        all_chunks = [f"{resumable_dir}/{i}" for i in await aio.os.listdir(resumable_dir)]
         all_chunks.sort(key=_natural_keys)
         chunks = [c for c in all_chunks if ".part" not in c]
         return await _info(chunks)
@@ -600,8 +599,8 @@ class SerialResumable(AbstractResumable):
         }
         return info
 
-    def _get_full_chunks_on_disk(self, work_dir: str, upload_id: str) -> list:
-        chunks_on_disk = os.listdir(work_dir + "/" + upload_id)
+    async def _get_full_chunks_on_disk(self, work_dir: str, upload_id: str) -> list:
+        chunks_on_disk = await aio.os.listdir(work_dir + "/" + upload_id)
         chunks_on_disk.sort(key=_natural_keys)
         full_chunks_on_disk = [
             c for c in chunks_on_disk if (".part" not in c and ".chunk" in c)
@@ -621,8 +620,8 @@ class SerialResumable(AbstractResumable):
             )
             relevant_dir = work_dir + "/" + upload_id
             relevant_merged_file = work_dir + "/" + filename + "." + upload_id
-            shutil.rmtree(relevant_dir)
-            os.remove(relevant_merged_file)
+            await aio.shutil.rmtree(relevant_dir)
+            await aio.os.remove(relevant_merged_file)
             assert await self._db_remove_completed_for_owner(upload_id), (
                 "could not remove data from resumables db"
             )
@@ -650,17 +649,17 @@ class SerialResumable(AbstractResumable):
         if ".chunk.end" in last_chunk_filename:
             logger.info("deleting: %s", chunks_dir)
             try:
-                os.rename(out, final)
+                await aio.os.rename(out, final)
             except FileNotFoundError as e:
                 logger.error(e)
-                if not os.path.exists(out) and os.path.exists(final):
+                if not (await aio.os.path.exists(out)) and (await aio.os.path.exists(final)):
                     logger.warning(
                         f"resumable upload '{upload_id}' has already been moved to its final path '{final}'"
                     )
                 else:
                     raise ResumableNotFoundError
             try:
-                shutil.rmtree(
+                await aio.shutil.rmtree(
                     chunks_dir
                 )  # do not need to fail upload if this does not work
             except OSError as e:
@@ -745,40 +744,40 @@ class SerialResumable(AbstractResumable):
         try:
             size_before_merge = None
             if chunk_num > 1:
-                os.link(out, out_lock)
-            with open(out, "ab") as fout:
+                await aio.os.link(out, out_lock)
+            async with aio.open(out, "ab") as fout:
                 if __debug__ and "offset" in verify:
-                    assert verify["offset"] == (fout_pos := fout.tell()) # The offset is expected to match the position in the `fout` file, since we'll be writing starting at said position
-                with open(chunk, "rb") as fin:
-                    size_before_merge = os.stat(out).st_size
+                    assert verify["offset"] == (fout_pos := await fout.tell()) # The offset is expected to match the position in the `fout` file, since we'll be writing starting at said position
+                async with aio.open(chunk, "rb") as fin:
+                    size_before_merge = (await aio.os.stat(out)).st_size
                     if __debug__ and "offset" in verify:
                         assert verify["offset"] == size_before_merge # The file opened as `fout` is not expected to contain data _past_ the passed offset value -- that would mean overwriting data with the `copy.fileobj` call below, violating data integrity (producing corruption / loss), also in light of the fact only the last chunk is ever permitted to be merged
-                    shutil.copyfileobj(fin, fout)
+                    await aio.shutil.copyfileobj(fin, fout)
                     if __debug__ and "chunk_size" in verify: # Implies `offset` is specified
-                        assert (fout_pos := fout.tell()) == (verify["offset"] + verify["chunk_size"]) # When copying is done with `copyfileobj` we expect the position in the destination file to match the sum of `offset` and `chunk_size` since such sum signifies the end of the chunk, also in light of the fact only the last chunk is ever permitted to be merged
+                        assert (fout_pos := await fout.tell()) == (verify["offset"] + verify["chunk_size"]) # When copying is done with `copyfileobj` we expect the position in the destination file to match the sum of `offset` and `chunk_size` since such sum signifies the end of the chunk, also in light of the fact only the last chunk is ever permitted to be merged
             if __debug__ and "md5sum" in verify:
-                with open(out, "rb") as fout:
-                    fout.seek(verify["offset"])
-                    md5sum = file_digest(SizeCappedFileReader(fout, verify["chunk_size"]), hashlib.md5).hexdigest()
+                async with aio.open(out, "rb") as fout:
+                    await fout.seek(verify["offset"])
+                    md5sum = (await file_digest(SizeCappedFileReader(fout, verify["chunk_size"]), hashlib.md5)).hexdigest()
                     if verify["md5sum"] == "return": # "return" communicates the caller only wants us to return _our_ checksum
                         state["md5sum"] = md5sum
                     else: # Otherwise we validate our value against caller's
                         assert md5sum == verify["md5sum"]
 
-            chunk_size = os.stat(chunk).st_size
+            chunk_size = (await aio.os.stat(chunk)).st_size
             if __debug__ and "chunk_size" in verify:
                 assert chunk_size == verify["chunk_size"]
             assert await self._db_update_with_chunk_info(upload_id, chunk_num, chunk_size, size_before_merge, md5sum if __debug__ and "md5sum" in verify else None) # `size_before_merge` is used for offset because we have asserted it matches `verify[`offset`]`
         except:
-            os.remove(chunk)
+            await aio.os.remove(chunk)
             if size_before_merge is not None:
-                with open(out, "ab") as fout:
-                    fout.truncate(size_before_merge)
+                async with aio.open(out, "ab") as fout:
+                    await fout.truncate(size_before_merge)
             raise
         finally:
             if chunk_num > 1:
                 try:
-                    os.unlink(out_lock)
+                    await aio.os.unlink(out_lock)
                 except:
                     logging.exception(f"Unlinking {out_lock} aborted")
         if chunk_num >= 5:
@@ -787,7 +786,7 @@ class SerialResumable(AbstractResumable):
                 ".chunk." + str(chunk_num), ".chunk." + str(target_chunk_num)
             )
             try:
-                os.remove(old_chunk)
+                await aio.os.remove(old_chunk)
             except:
                 logger.exception(f"Removing {old_chunk} aborted")
         return final, state
