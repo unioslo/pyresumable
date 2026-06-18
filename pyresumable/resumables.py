@@ -16,7 +16,11 @@ from typing import Union
 from .utils import file_digest
 from .utils import SizeCappedFileReader
 
-from . import aio
+from tsdfileapi.aio.builtins import open as aopen
+import tsdfileapi.aio.io
+import tsdfileapi.aio.os
+import tsdfileapi.aio.shutil
+from tsdfileapi import aio
 
 AsyncBufferedRandom: TypeAlias = aio.io.BufferedRandom
 
@@ -82,7 +86,7 @@ async def session_scope(
 
 
 async def md5sum(filename: str, blocksize: int = 65536) -> str:
-    async with aio.open(filename, "rb") as f:
+    async with aopen(filename, "rb") as f:
         return (await file_digest(f, hashlib.md5, _bufsize=blocksize)).hexdigest()
 
 
@@ -288,7 +292,7 @@ class SerialResumable(AbstractResumable):
         )
 
     async def open_file(self, filename: str, *args, **kwargs) -> AsyncBufferedRandom:
-        file = await aio.open(filename, *args, **kwargs)
+        file = await aopen(filename, *args, **kwargs)
         await aio.os.chmod(filename, _RW______)
         return file
 
@@ -463,10 +467,10 @@ class SerialResumable(AbstractResumable):
             diff = sum_chunks_size - merged_file_size
             if (merged_file_size < sum_chunks_size) and (diff <= last_chunk_size):
                 target_size = sum_chunks_size - last_chunk_size
-                async with aio.open(merged_file, "ab") as f:
+                async with aopen(merged_file, "ab") as f:
                     await f.truncate(target_size)
-                async with aio.open(merged_file, "ab") as fout:
-                    async with aio.open(last_chunk, "rb") as fin:
+                async with aopen(merged_file, "ab") as fout:
+                    async with aopen(last_chunk, "rb") as fin:
                         await aio.shutil.copyfileobj(fin, fout)
                 new_merged_size = (await aio.os.stat(merged_file)).st_size
                 logger.info(
@@ -744,10 +748,10 @@ class SerialResumable(AbstractResumable):
             size_before_merge = None
             if chunk_num > 1:
                 await aio.os.link(out, out_lock)
-            async with aio.open(out, "ab") as fout:
+            async with aopen(out, "ab") as fout:
                 if __debug__ and "offset" in verify:
                     assert verify["offset"] == (fout_pos := await fout.tell()) # The offset is expected to match the position in the `fout` file, since we'll be writing starting at said position
-                async with aio.open(chunk, "rb") as fin:
+                async with aopen(chunk, "rb") as fin:
                     size_before_merge = (await aio.os.stat(out)).st_size
                     if __debug__ and "offset" in verify:
                         assert verify["offset"] == size_before_merge # The file opened as `fout` is not expected to contain data _past_ the passed offset value -- that would mean overwriting data with the `copy.fileobj` call below, violating data integrity (producing corruption / loss), also in light of the fact only the last chunk is ever permitted to be merged
@@ -755,7 +759,7 @@ class SerialResumable(AbstractResumable):
                     if __debug__ and "chunk_size" in verify: # Implies `offset` is specified
                         assert (fout_pos := await fout.tell()) == (verify["offset"] + verify["chunk_size"]) # When copying is done with `copyfileobj` we expect the position in the destination file to match the sum of `offset` and `chunk_size` since such sum signifies the end of the chunk, also in light of the fact only the last chunk is ever permitted to be merged
             if __debug__ and "md5sum" in verify:
-                async with aio.open(out, "rb") as fout:
+                async with aopen(out, "rb") as fout:
                     await fout.seek(verify["offset"])
                     md5sum = (await file_digest(SizeCappedFileReader(fout, verify["chunk_size"]), hashlib.md5)).hexdigest()
                     if verify["md5sum"] == "return": # "return" communicates the caller only wants us to return _our_ checksum
@@ -770,7 +774,7 @@ class SerialResumable(AbstractResumable):
         except:
             await aio.os.remove(chunk)
             if size_before_merge is not None:
-                async with aio.open(out, "ab") as fout:
+                async with aopen(out, "ab") as fout:
                     await fout.truncate(size_before_merge)
             raise
         finally:

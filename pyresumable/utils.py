@@ -4,7 +4,8 @@ from asyncio import to_thread
 from typing import TypeAlias
 from typing_extensions import Buffer # TODO: When upgrading dependencies to demand Python >=3.12, change `typing_extensions` to `collections.abc`
 
-from . import aio
+import tsdfileapi.aio.io
+from tsdfileapi import aio
 
 AsyncRawIOBase: TypeAlias = aio.io.RawIOBase
 
