@@ -1,3 +1,4 @@
+import hashlib
 import os
 from typing import TypeAlias
 from typing_extensions import Buffer # TODO: When upgrading dependencies to demand Python >=3.12, change `typing_extensions` to `collections.abc`
