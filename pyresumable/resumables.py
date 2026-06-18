@@ -5,7 +5,6 @@ import os
 import re
 import aiosqlite
 import stat
-import threading
 import uuid
 from abc import ABC
 from abc import abstractmethod
